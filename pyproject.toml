@@ -12,6 +12,12 @@ dependencies = ["gurobipy>=10", "scipy"]
 [project.scripts]
 mipmorph= "mip_morph.cli:main"
 
+# Build-only tooling. Nuitka compiles the secret transform modules to native
+# machine code; it is NOT a runtime dependency of the package. Install with
+# `uv sync --group build` (or `uv pip install nuitka`) on the build machine.
+[dependency-groups]
+build = ["nuitka>=2"]
+
 [tool.setuptools]
 packages = ["mip_morph"]
 

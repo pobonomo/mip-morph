@@ -5,6 +5,10 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
+# Obfuscated-build artifacts (see scripts/build_obfuscated.sh)
+build_obf/
+dist/
+
 # uv / virtualenvs
 # The real environment lives in iis_checker/ (iis_checker/.venv, iis_checker/uv.lock).
 # The repo root is not a Python package; a uv.lock/.venv here is a stray from
