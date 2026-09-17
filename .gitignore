@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# uv / virtualenvs
+# The real environment lives in iis_checker/ (iis_checker/.venv, iis_checker/uv.lock).
+# The repo root is not a Python package; a uv.lock/.venv here is a stray from
+# running `uv` in the wrong directory.
+.venv/
+/uv.lock
