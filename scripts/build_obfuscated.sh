@@ -3,11 +3,17 @@
 # Build an obfuscated distribution of mip-morph.
 #
 # The transformation IP lives in three pure-Python modules — ir.py, morph.py and
-# transforms.py. This script compiles ONLY those three modules to native
-# machine-code extension modules (.so) with Nuitka, then assembles a shippable
-# package under dist/ where the compiled .so files REPLACE the .py sources. The
-# gurobi read/write module (io.py) and the CLI (cli.py) stay as normal Python,
-# and gurobipy itself is never touched — it is imported normally at runtime.
+# transforms.py — plus a hardened release CLI (cli_release.py) that removes the
+# options and output which make the transformation transparent (the per-transform
+# log and the --enable/--disable transform-name selection). This script compiles
+# those modules to native machine-code extension modules (.so) with Nuitka, then
+# assembles a shippable package under dist/ where:
+#   * the compiled .so files REPLACE the .py sources, and
+#   * the full-featured cli.py is REPLACED by a tiny stub that re-exports the
+#     compiled release CLI, so `mipmorph`/`python -m mip_morph` use the hardened
+#     interface and the developer-only options never ship.
+# The gurobi read/write module (io.py) stays as normal Python, and gurobipy
+# itself is never touched — it is imported normally at runtime.
 #
 # IMPORTANT
 #   * A compiled .so is tied to the exact OS/arch and Python minor version it was
@@ -27,8 +33,9 @@ PKG="mip_morph"
 BUILD_DIR="${ROOT}/build_obf"
 DIST_PKG="${ROOT}/dist/${PKG}"
 
-# Modules whose source must NOT ship — compiled to .so instead.
-SECRET_MODULES=(ir morph transforms)
+# Modules whose source must NOT ship — compiled to .so instead. cli_release is
+# the hardened CLI; the full-featured cli.py is replaced by a stub (see below).
+SECRET_MODULES=(ir morph transforms cli_release)
 
 PY="${PYTHON:-python}"
 
@@ -69,10 +76,24 @@ for so in "${BUILD_DIR}"/*.so; do
   cp "${so}" "${DIST_PKG}/"
 done
 
+# Replace the full-featured CLI with a stub that re-exports the compiled,
+# hardened release CLI. The developer-only options and the per-transform log
+# never ship, and cli.py carries no logic worth reading.
+rm -f "${DIST_PKG}/cli.py"
+cat > "${DIST_PKG}/cli.py" <<'STUB'
+"""Release CLI shim: delegates to the compiled, hardened cli_release module."""
+
+from .cli_release import build_parser, main
+
+__all__ = ["build_parser", "main"]
+STUB
+
 echo
 echo ">> Done. Obfuscated package is at: dist/${PKG}"
 echo ">> Sanity checks:"
-echo "     ls dist/${PKG}                 # ir/morph/transforms are .so, no .py"
+echo "     ls dist/${PKG}                 # ir/morph/transforms/cli_release are .so; cli.py is a stub"
+echo "     PYTHONPATH=dist python -m mip_morph --help   # no --enable/--disable, no transform list"
+echo "     PYTHONPATH=dist python -m mip_morph in.mps -o out.mps  # runs silently (no per-transform log)"
 echo "     strings dist/${PKG}/transforms*.so | grep -i 'def ' || echo 'no python source'"
 echo ">> Verify against the test suite by pointing PYTHONPATH at dist/:"
 echo "     PYTHONPATH=dist python -m pytest"
