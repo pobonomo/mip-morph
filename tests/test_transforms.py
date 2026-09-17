@@ -271,7 +271,8 @@ def test_explicit_slack_reports_where_it_folded(ctx):
     problem.add_row("r1", {1: 1.0}, "<", 5.0)
 
     description = add_explicit_slack(problem, random.Random(0), ctx)
-    assert "folded into" in description
+    assert "folded into" in str(description)
+    assert description.params["fold"] is not None
 
 
 def test_explicit_slack_respects_the_density_cap():
@@ -292,7 +293,8 @@ def test_explicit_slack_respects_the_density_cap():
     tight = Context(mix_max_nnz=3)
     description = add_explicit_slack(problem, random.Random(0), tight)
     assert description is not None
-    assert "singleton" in description
+    assert "singleton" in str(description)
+    assert description.params["fold"] is None
     slack_index = len(problem.vars) - 1
     occurrences = Counter(j for r in problem.rows for j in r.coeffs)
     assert occurrences[slack_index] == 1

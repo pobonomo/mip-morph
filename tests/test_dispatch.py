@@ -91,7 +91,7 @@ def test_dispatch_hits_the_requested_number_of_rows():
     ctx = Context(dispatch_fanout=3)
     description = dispatch_equality(problem, random.Random(0), ctx)
     assert description is not None
-    assert "into 3 rows" in description
+    assert "into 3 rows" in str(description)
 
     changed = sum(1 for old, r in zip(before, problem.rows) if old != r.coeffs)
     assert changed == 3, "exactly the fanout many rows should have moved"
@@ -184,7 +184,7 @@ def test_dispatch_fanout_is_clamped_to_available_targets():
         problem, random.Random(0), Context(dispatch_fanout=10)
     )
     assert description is not None
-    assert "into 1 rows" in description
+    assert "into 1 rows" in str(description)
 
 
 # ---------------------------------------------------------------------------
@@ -265,7 +265,7 @@ def test_dispatch_is_reachable_from_the_driver():
         rename=False,
         shuffle=False,
     )
-    assert any("dispatch" in entry for entry in log), f"never applied: {log[:5]}"
+    assert any("dispatch" in str(entry) for entry in log), f"never applied: {log[:5]}"
 
 
 def test_driver_threads_the_fanout_through_to_the_transform():
@@ -280,9 +280,12 @@ def test_driver_threads_the_fanout_through_to_the_transform():
             rename=False,
             shuffle=False,
         )
-        dispatches = [e for e in log if e.startswith("dispatch")]
+        dispatches = [e for e in log if e.op == "dispatch"]
         assert dispatches, f"fanout {fanout}: nothing dispatched"
-        assert all(f"into {fanout} rows" in e for e in dispatches), dispatches
+        assert all(f"into {fanout} rows" in str(e) for e in dispatches), dispatches
+        # The recorded fold count must agree with the text, since that is what
+        # the inverse actually walks.
+        assert all(len(e.params["folds"]) == fanout for e in dispatches), dispatches
 
 
 def test_default_fanout_is_used_when_unspecified():

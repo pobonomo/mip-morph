@@ -2,8 +2,18 @@
 
 Every transformation keeps the optimal objective value and the feasibility
 status of the model intact, while changing its structure. Each one takes
-``(problem, rng, ctx)`` and returns a short description of what it did, or
-``None`` when the model offers no candidate to work on.
+``(problem, rng, ctx)`` and returns a :class:`~mip_morph.key.Step` describing
+what it did, or ``None`` when the model offers no candidate to work on.
+
+A ``Step`` prints as the short human-readable sentence these functions have
+always returned, and additionally carries the exact parameters of the choice it
+made, which is what makes a run invertible from a key. Those parameters are
+column and row *indices*, never names: ``rename_all`` rewrites every name at the
+end of a run, and a transformation that adds a column names it after the current
+column count, so names are not stable identifiers here. Indices are -- no
+transformation ever deletes a column or a row (``split-free`` retires its column
+instead), and every addition is appended, so an index means the same thing for
+the whole run.
 
 Scale factors are dyadic (powers of two) by default so that every
 multiplication is exact in IEEE double arithmetic and equivalence is bit-exact.
@@ -11,6 +21,7 @@ multiplication is exact in IEEE double arithmetic and equivalence is bit-exact.
 """
 
 from .ir import BINARY, CONTINUOUS, FLIP, INF, drop_zeros, negate
+from .key import Step
 
 DYADIC = (0.125, 0.25, 0.5, 2.0, 4.0, 8.0)
 MIX_LAMBDAS = (-4.0, -2.0, -1.0, -0.5, 0.5, 1.0, 2.0, 4.0)
@@ -51,6 +62,17 @@ class Context:
         return rng.choice(MIX_LAMBDAS)
 
 
+def _row_indices(problem):
+    """All row indices.
+
+    Picking an index rather than a row object costs nothing: ``rng.choice`` and
+    ``rng.sample`` consume generator state as a function of ``len`` alone, so
+    choosing over indices leaves every existing seed producing exactly the
+    output it produced before.
+    """
+    return range(len(problem.rows))
+
+
 # --------------------------------------------------------------------------
 # variable substitutions
 # --------------------------------------------------------------------------
@@ -79,7 +101,14 @@ def complement_variable(problem, rng, ctx):
 
     problem.obj_offset += var.obj * total
     var.obj = negate(var.obj)
-    return f"complement {var.name} (x -> {total:g} - x)"
+    # ``total`` is recorded rather than re-derived: the substitution leaves the
+    # bounds alone, but a later ``shift`` or ``scale-var`` on the same column
+    # moves them, so l + u read off the hidden model is the wrong number.
+    return Step(
+        "complement",
+        {"var": j, "total": total},
+        f"complement {var.name} (x -> {total:g} - x)",
+    )
 
 
 def shift_variable(problem, rng, ctx):
@@ -112,7 +141,9 @@ def shift_variable(problem, rng, ctx):
         row.rhs -= row.coeffs[j] * delta
 
     problem.obj_offset += var.obj * delta
-    return f"shift {var.name} by {delta:g}"
+    return Step(
+        "shift", {"var": j, "delta": delta}, f"shift {var.name} by {delta:g}"
+    )
 
 
 def scale_variable(problem, rng, ctx):
@@ -138,7 +169,11 @@ def scale_variable(problem, rng, ctx):
     for row in problem.rows_with(j):
         row.coeffs[j] *= factor
 
-    return f"scale {var.name} (x -> {factor:g} y)"
+    return Step(
+        "scale-var",
+        {"var": j, "factor": factor},
+        f"scale {var.name} (x -> {factor:g} y)",
+    )
 
 
 def encode_binary_as_xor(problem, rng, ctx):
@@ -173,20 +208,31 @@ def encode_binary_as_xor(problem, rng, ctx):
     v = problem.add_var(f"_v{tag}", lb=0.0, ub=1.0, obj=0.0, vtype=BINARY)
     w = problem.add_var(f"_w{tag}", lb=0.0, ub=1.0, obj=0.0, vtype=BINARY)
 
-    problem.add_row(f"_and{tag}a", {w: 1.0, u: -1.0}, "<", 0.0)
-    problem.add_row(f"_and{tag}b", {w: 1.0, v: -1.0}, "<", 0.0)
-    problem.add_row(f"_and{tag}c", {w: 1.0, u: -1.0, v: -1.0}, ">", -1.0)
-    problem.add_row(f"_xor{tag}", {j: 1.0, u: -1.0, v: -1.0, w: 2.0}, "=", 0.0)
+    rows = [
+        problem.add_row(f"_and{tag}a", {w: 1.0, u: -1.0}, "<", 0.0),
+        problem.add_row(f"_and{tag}b", {w: 1.0, v: -1.0}, "<", 0.0),
+        problem.add_row(f"_and{tag}c", {w: 1.0, u: -1.0, v: -1.0}, ">", -1.0),
+        problem.add_row(f"_xor{tag}", {j: 1.0, u: -1.0, v: -1.0, w: 2.0}, "=", 0.0),
+    ]
 
     # x keeps its bounds, cost and every existing row entry; only its declared
-    # type relaxes, because integrality now follows from the linking row.
+    # type relaxes, because integrality now follows from the linking row. That
+    # type is the one thing here a key cannot re-derive from the hidden model --
+    # a 0/1 column may have been declared BINARY or INTEGER -- so record it.
+    vtype = var.vtype
     var.vtype = CONTINUOUS
-    return f"encode binary {var.name} as XOR of {problem.vars[u].name}, {problem.vars[v].name}"
+    return Step(
+        "xor-binary",
+        {"var": j, "u": u, "v": v, "w": w, "rows": rows, "vtype": vtype},
+        f"encode binary {var.name} as XOR of {problem.vars[u].name}, {problem.vars[v].name}",
+    )
 
 
 def split_free_variable(problem, rng, ctx):
     """Replace a free variable by the difference of two non-negative ones."""
-    candidates = [j for j, v in enumerate(problem.vars) if v.lb <= -INF and v.ub >= INF]
+    candidates = [
+        j for j, v in enumerate(problem.vars) if v.lb <= -INF and v.ub >= INF
+    ]
     if not candidates:
         return None
 
@@ -204,11 +250,18 @@ def split_free_variable(problem, rng, ctx):
         drop_zeros(row)
 
     # Retire the original column rather than deleting it, so that the indices
-    # held by every other row stay valid.
+    # held by every other row stay valid. The three values overwritten here are
+    # recorded, because reading them back off the new columns is only correct
+    # while nothing later touches them.
+    lb, ub, obj = var.lb, var.ub, var.obj
     var.lb = 0.0
     var.ub = 0.0
     var.obj = 0.0
-    return f"split free {var.name} into {var.name}_p - {var.name}_n"
+    return Step(
+        "split-free",
+        {"var": j, "pos": pos, "neg": neg, "lb": lb, "ub": ub, "obj": obj},
+        f"split free {var.name} into {var.name}_p - {var.name}_n",
+    )
 
 
 # --------------------------------------------------------------------------
@@ -221,7 +274,8 @@ def scale_row(problem, rng, ctx):
     if not problem.rows:
         return None
 
-    row = rng.choice(problem.rows)
+    i = rng.choice(_row_indices(problem))
+    row = problem.rows[i]
     factor = ctx.scale_factor(rng)
 
     for j in row.coeffs:
@@ -230,45 +284,72 @@ def scale_row(problem, rng, ctx):
     if factor < 0:
         row.sense = FLIP[row.sense]
 
-    return f"scale row {row.name} by {factor:g}"
+    return Step(
+        "scale-row",
+        {"row": i, "factor": factor},
+        f"scale row {row.name} by {factor:g}",
+    )
 
 
 def invert_row(problem, rng, ctx):
     """Turn a <= row into a >= row (or vice versa) by negating it."""
-    candidates = [r for r in problem.rows if r.sense != "="]
+    candidates = [i for i, r in enumerate(problem.rows) if r.sense != "="]
     if not candidates:
         return None
 
-    row = rng.choice(candidates)
+    i = rng.choice(candidates)
+    row = problem.rows[i]
     for j in row.coeffs:
         row.coeffs[j] = -row.coeffs[j]
     row.rhs = -row.rhs
     row.sense = FLIP[row.sense]
-    return f"invert row {row.name}"
+    return Step("invert-row", {"row": i}, f"invert row {row.name}")
 
 
-def _spread_row_into_another(problem, rng, ctx, donor):
-    """Fold equality ``donor`` into some other row.
+def _fold_into(problem, donor_index, target_index, lam):
+    """Add ``lam`` times row ``donor_index`` to row ``target_index``.
 
-    Returns ``(lam, target)`` on success and ``None`` when there is no eligible
-    target. Shared by ``slack``, which must not leave its new column as a
-    singleton, so both callers obey the same density cap: a dense donor would
-    otherwise smear across the matrix and show up as a fill-in tell.
+    Returns the fold's record: the multiplier, the target, and the columns the
+    fold *introduced* into the target. That last list is what lets the fold be
+    undone exactly. Subtracting the multiple back restores the numbers, but not
+    the sparsity: the forward pass drops entries that cancel to zero, and an
+    inverse working from the numbers alone cannot always tell an entry the fold
+    created from one it merely changed. Under ``--sloppy-scaling`` two folds
+    touching the same entry leave a rounding residue where a clean zero would
+    have been, and guessing from that residue would leave a stray coefficient
+    behind -- on a column that is about to be removed, which would be a dangling
+    reference rather than a rounding error. Recording the answer costs a few
+    integers and removes the guess.
     """
-    if not 0 < donor.nnz <= ctx.mix_max_nnz:
-        return None
-
-    targets = [r for r in problem.rows if r is not donor]
-    if not targets:
-        return None
-
-    target = rng.choice(targets)
-    lam = ctx.mix_lambda(rng)
+    donor = problem.rows[donor_index]
+    target = problem.rows[target_index]
+    created = sorted(j for j in donor.coeffs if j not in target.coeffs)
     for j, coef in donor.coeffs.items():
         target.coeffs[j] = target.coeffs.get(j, 0.0) + lam * coef
     target.rhs += lam * donor.rhs
     drop_zeros(target)
-    return lam, target
+    return {"target": target_index, "lam": lam, "created": created}
+
+
+def _spread_row_into_another(problem, rng, ctx, donor_index):
+    """Fold equality row ``donor_index`` into some other row.
+
+    Returns the fold record on success and ``None`` when there is no eligible
+    target. Shared by ``slack``, which must not leave its new column as a
+    singleton, so both callers obey the same density cap: a dense donor would
+    otherwise smear across the matrix and show up as a fill-in tell.
+    """
+    donor = problem.rows[donor_index]
+    if not 0 < donor.nnz <= ctx.mix_max_nnz:
+        return None
+
+    targets = [i for i in _row_indices(problem) if i != donor_index]
+    if not targets:
+        return None
+
+    target_index = rng.choice(targets)
+    lam = ctx.mix_lambda(rng)
+    return _fold_into(problem, donor_index, target_index, lam)
 
 
 def add_explicit_slack(problem, rng, ctx):
@@ -290,26 +371,38 @@ def add_explicit_slack(problem, rng, ctx):
     and ``mix-obj``, which is where the hard-to-detect work happens. Doing one
     mix here is what makes the new column pay for itself.
     """
-    candidates = [r for r in problem.rows if r.sense != "="]
+    candidates = [i for i, r in enumerate(problem.rows) if r.sense != "="]
     if not candidates:
         return None
 
-    row = rng.choice(candidates)
+    i = rng.choice(candidates)
+    row = problem.rows[i]
     slack = problem.add_var(f"_s{len(problem.vars)}", lb=0.0, ub=INF, obj=0.0)
     row.coeffs[slack] = 1.0 if row.sense == "<" else -1.0
+    # The sign of the slack coefficient does encode the old sense, but only
+    # until a later ``scale-row`` or ``invert-row`` touches the row, so record
+    # the sense itself.
     old_sense = row.sense
     row.sense = "="
 
-    spread = _spread_row_into_another(problem, rng, ctx, row)
-    if spread is None:
+    fold = _spread_row_into_another(problem, rng, ctx, i)
+    if fold is None:
         note = " (left as a singleton: nothing eligible to fold into)"
     else:
-        note = f", folded into {spread[1].name}"
-    return f"add slack to row {row.name} ({old_sense}= -> =){note}"
+        note = f", folded into {problem.rows[fold['target']].name}"
+    return Step(
+        "slack",
+        {"row": i, "slack": slack, "old_sense": old_sense, "fold": fold},
+        f"add slack to row {row.name} ({old_sense}= -> =){note}",
+    )
 
 
 def _equality_donors(problem, ctx):
-    return [r for r in problem.rows if r.sense == "=" and 0 < r.nnz <= ctx.mix_max_nnz]
+    return [
+        i
+        for i, r in enumerate(problem.rows)
+        if r.sense == "=" and 0 < r.nnz <= ctx.mix_max_nnz
+    ]
 
 
 def dispatch_equality(problem, rng, ctx):
@@ -342,21 +435,24 @@ def dispatch_equality(problem, rng, ctx):
     if not donors:
         return None
 
-    donor = rng.choice(donors)
-    targets = [r for r in problem.rows if r is not donor]
+    donor_index = rng.choice(donors)
+    donor = problem.rows[donor_index]
+    targets = [i for i in _row_indices(problem) if i != donor_index]
     if not targets:
         return None
 
     fanout = min(max(2, ctx.dispatch_fanout), len(targets))
     chosen = rng.sample(targets, fanout)
-    for target in chosen:
+    folds = []
+    for target_index in chosen:
         lam = ctx.mix_lambda(rng)
-        for j, coef in donor.coeffs.items():
-            target.coeffs[j] = target.coeffs.get(j, 0.0) + lam * coef
-        target.rhs += lam * donor.rhs
-        drop_zeros(target)
+        folds.append(_fold_into(problem, donor_index, target_index, lam))
 
-    return f"dispatch {donor.name} into {fanout} rows"
+    return Step(
+        "dispatch",
+        {"donor": donor_index, "folds": folds},
+        f"dispatch {donor.name} into {fanout} rows",
+    )
 
 
 # A cancelling variant of ``dispatch`` was implemented and removed. Choosing
@@ -385,12 +481,17 @@ def mix_equality_into_row(problem, rng, ctx):
     if not donors:
         return None
 
-    donor = rng.choice(donors)
-    spread = _spread_row_into_another(problem, rng, ctx, donor)
-    if spread is None:
+    donor_index = rng.choice(donors)
+    fold = _spread_row_into_another(problem, rng, ctx, donor_index)
+    if fold is None:
         return None
-    lam, target = spread
-    return f"mix {lam:g} x {donor.name} into {target.name}"
+    donor = problem.rows[donor_index]
+    target = problem.rows[fold["target"]]
+    return Step(
+        "mix-row",
+        {"donor": donor_index, "fold": fold},
+        f"mix {fold['lam']:g} x {donor.name} into {target.name}",
+    )
 
 
 def mix_equality_into_objective(problem, rng, ctx):
@@ -414,14 +515,19 @@ def mix_equality_into_objective(problem, rng, ctx):
     if not donors:
         return None
 
-    donor = rng.choice(donors)
+    donor_index = rng.choice(donors)
+    donor = problem.rows[donor_index]
     lam = ctx.mix_lambda(rng)
 
     for j, coef in donor.coeffs.items():
         problem.vars[j].obj += lam * coef
     problem.obj_offset -= lam * donor.rhs
 
-    return f"mix {lam:g} x {donor.name} into objective"
+    return Step(
+        "mix-obj",
+        {"donor": donor_index, "lam": lam},
+        f"mix {lam:g} x {donor.name} into objective",
+    )
 
 
 TRANSFORMS = {

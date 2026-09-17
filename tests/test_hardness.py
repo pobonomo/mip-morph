@@ -139,7 +139,7 @@ def test_preserve_objective_can_be_overridden():
         preserve_objective=False,
         enable=["slack", "mix-obj"],
     )
-    assert any("into objective" in entry for entry in log), log[:5]
+    assert any("into objective" in str(entry) for entry in log), log[:5]
     assert not hidden.objective_is_zero(), (
         "explicitly disabling the guard should allow objective mixing"
     )
@@ -151,8 +151,8 @@ def test_guard_holds_even_when_slacks_create_donors():
     assert not problem.equality_rows()
 
     hidden, log = morph_model(problem, rounds=80, seed=3, enable=["slack", "mix-obj"])
-    assert any("add slack" in entry for entry in log), "slack should have applied"
-    assert not any("into objective" in entry for entry in log)
+    assert any("add slack" in str(entry) for entry in log), "slack should have applied"
+    assert not any("into objective" in str(entry) for entry in log)
     assert hidden.objective_is_zero()
 
 

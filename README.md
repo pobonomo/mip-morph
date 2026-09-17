@@ -4,6 +4,9 @@ Read a MIP in MPS format, apply a randomized sequence of **equivalence-preservin
 and write it out under a different name. The result is the same optimization problem — same optimal
 objective value, same feasibility status — but structurally unrecognizable.
 
+Each run also writes a **key**, which recovers the original model, and translates a solution of the
+hidden model back to the original variables. Without the key the hiding is not reversible.
+
 ## Usage
 
 ```bash
@@ -31,17 +34,32 @@ options:
                         allow objective mixing even on a zero-objective model
   --no-rename           keep the original names
   --no-shuffle          keep the original row/column order
+  --key PATH            where to write the recovery key (default <output>.key)
+  --no-key              write no key, making the hiding one-way
+  --key-password PW     encrypt the key; also read from $MIPMORPH_KEY_PASSWORD
   -q, --quiet           only report errors
 ```
+
+Every run also writes a **key** next to the output, which is what makes hiding reversible:
+
+```bash
+python -m mipmorph unhide     hidden.mps -o recovered.mps   # -> the original model
+python -m mipmorph unhide-sol hidden.sol -o original.sol    # -> the original variables
+```
+
+Both read `<input>.key` unless `--key` says otherwise. See [The key](#the-key) below.
 
 As a library:
 
 ```python
-from mip_morph import read_problem, hide_model, write_problem
+from mip_morph import morph_model, read_problem, unmorph_problem, write_key, write_problem
 
 problem = read_problem("model.mps")
-hidden, log = hide_model(problem, rounds=40, seed=42)
+hidden, log = morph_model(problem, rounds=40, seed=42)
 write_problem(hidden, "hidden.mps")
+write_key(log.key, "hidden.mps.key")
+
+assert unmorph_problem(hidden, log.key) == problem
 ```
 
 ## Transformations
@@ -253,8 +271,77 @@ Models with quadratic objectives or constraints, SOS constraints, general constr
 piecewise-linear objectives, or semi-continuous variables are refused outright rather than silently
 mishandled.
 
-Hiding is one-way: no inverse mapping is written, so a solution to the hidden model cannot be
-translated back to the original variables.
+## The key
+
+Hiding used to be one-way. It is now reversible, through a key written alongside the hidden model
+that records the exact edit list: `key + hidden model → the original model`, and
+`key + a solution of the hidden model → values of the original variables`. Pass `--no-key` to get
+the old one-way behaviour back.
+
+Solutions come back because the row operations are identity on the variable space — `mix-row`,
+`dispatch`, `scale-row`, `invert-row` and `mix-obj` rewrite the constraints a point satisfies, not
+the point — so only the four variable substitutions have to be inverted, and each has a closed form
+(`x = total - x'`, `x = y + δ`, `x = a·y`, `x = x⁺ - x⁻`).
+
+### Why the printed log cannot be the key
+
+The human-readable log is lossy in five separate ways, which is why the key records parameters
+separately from the description:
+
+| loss                                                                        | consequence                            |
+| --------------------------------------------------------------------------- | -------------------------------------- |
+| every float is `%g`-formatted, i.e. six significant digits                   | `--sloppy-scaling` factors unrecoverable |
+| `dispatch` names neither its target rows nor its per-target multipliers      | the fanout cannot be undone            |
+| `slack` reports where it folded but not the multiplier                       | the fold cannot be undone              |
+| `xor-binary` overwrites the original `vtype` and never reports it            | BINARY vs INTEGER lost                 |
+| `rename_all` discards the name map, `shuffle_all` both permutations          | nothing can be lined up again          |
+
+Replaying the driver from its seed is not an alternative either. The coefficient-range guard rolls a
+candidate back **after** it has already drawn from the RNG, and only accepted steps are logged, so
+the seed and the list of accepted steps do not determine one another.
+
+### What makes the inverse exact
+
+Two properties the forward transformations already had:
+
+- **Indices mean the same thing all run.** No transformation deletes a column or a row —
+  `split-free` *retires* its column rather than removing it — and every addition is appended. So the
+  original columns keep indices `0…n₀-1` for the whole run, and whatever a step appended is still at
+  the tail when that step comes to be undone.
+- **Steps are undone in reverse.** Walking backwards, by the time step *k* is reached the model is
+  exactly in its post-step-*k* state, so every index it recorded still points where it did and the
+  rows a fold read are unmodified since. No inverse has to reason about what came after it.
+
+Only the final shuffle defeats indices, so recovery starts by re-indexing the hidden model onto the
+*pre-shuffle* names stored in the key. That one step undoes the permutation and absorbs any
+reordering the writer or reader introduced, so nothing downstream has to trust file order.
+
+Two places need care. `scale-var` must **divide by the recorded factor**, never multiply by a stored
+reciprocal — `1/0.1` is not representable. And a fold has to restore the target's *sparsity*, not
+just its numbers, since the forward pass drops entries that cancel to zero; the key records which
+columns each fold introduced rather than letting the inverse guess from the values, because under
+`--sloppy-scaling` two folds touching one entry leave a rounding residue where a clean zero would
+have been.
+
+With that, recovery of a default run is **exact, not approximate** — `tests/test_key.py` asserts
+coefficient-for-coefficient equality over 20 random models at chain depths of 1, 5, 40 and 120, and
+through a write/read round trip in both MPS and LP format.
+
+### Three honest limits
+
+1. **The key recovers the model as read, not the original file's bytes.** Gurobi's reader desugars an
+   MPS `RANGES` entry into an equality plus an auxiliary column, and drops explicitly stored zeros,
+   both *before* the IR exists. Those happen upstream of anything a key can observe, so a model with
+   `RANGES` recovers to its desugared equivalent — the same mathematics, not the same MPS.
+2. **`--sloppy-scaling` recovers only to floating-point tolerance**, because the forward pass itself
+   rounds there. The key still stores the exact factor, which is the best available.
+3. **A key without a password is obfuscated, not encrypted.** On disk it is canonical JSON, then
+   zlib, then base64 behind a magic line, so it is not human-readable and will not be skimmed by
+   accident — but anyone who wants the contents can inflate them in two lines. Pass
+   `--key-password` (or `$MIPMORPH_KEY_PASSWORD`, which keeps it out of the process list) for actual
+   confidentiality: scrypt for the KDF, an HMAC-SHA256 counter-mode keystream, and encrypt-then-MAC
+   so a damaged key is refused rather than half-decoded. This matters, because a leaked key undoes
+   the hiding completely.
 
 ## Tests
 
@@ -272,6 +359,12 @@ Two suites check things the solver cannot show directly: `tests/test_exactness.p
 transformation chains in exact rational arithmetic to verify the float path does not round, and
 `tests/test_dispatch.py` asserts the structural invariant that separates hiding from presolve — no
 transformation may shrink a column's support or leave a free column singleton behind.
+
+Recovery is the one place equality *is* asserted directly, since a key makes the mapping explicit:
+`tests/test_key.py` compares the recovered model to the original coefficient by coefficient, inverts
+each transformation on its own, maps solutions back and evaluates them on the original model, and
+checks that a key from another run, another model, or a wrong password is refused rather than
+half-applied.
 
 Test models stay well under 2000 variables/constraints so they run on the size-limited Gurobi trial
 license.

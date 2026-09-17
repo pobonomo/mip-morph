@@ -323,7 +323,7 @@ def test_xor_growth_is_capped_in_mixed_runs():
     problem = _binary_model(n=10)
     rounds = 40
     hidden, log = morph_model(problem, rounds=rounds, seed=1)
-    applications = sum(1 for entry in log if "as XOR of" in entry)
+    applications = sum(1 for entry in log if "as XOR of" in str(entry))
     assert applications <= max(1, int(rounds * 0.25)), applications
     assert len(hidden.vars) < len(problem.vars) + 3 * rounds
 
