@@ -204,7 +204,9 @@ def _unfold(problem, donor_index, fold, step):
     target = _row(problem, target_index, step)
     lam = fold["lam"]
     created = set(fold["created"])
-    _fits(step, donor_index != target_index, "a row cannot have been folded into itself")
+    _fits(
+        step, donor_index != target_index, "a row cannot have been folded into itself"
+    )
     for j, coef in donor.coeffs.items():
         if j in created:
             target.coeffs.pop(j, None)
@@ -244,6 +246,12 @@ def _undo_shift(problem, step):
     for row in problem.rows_with(j):
         row.rhs += row.coeffs[j] * delta
     problem.obj_offset -= var.obj * delta
+
+
+def _undo_shift_binary(problem, step):
+    """Un-shift, then restore the declared type the forward pass overwrote."""
+    _undo_shift(problem, step)
+    _var(problem, step.params["var"], step).vtype = step.params["vtype"]
 
 
 def _undo_scale_var(problem, step):
@@ -399,6 +407,7 @@ def _undo_mix_obj(problem, step):
 INVERSES = {
     "complement": _undo_complement,
     "shift": _undo_shift,
+    "shift-binary": _undo_shift_binary,
     "scale-var": _undo_scale_var,
     "xor-binary": _undo_xor_binary,
     "split-free": _undo_split_free,
@@ -510,6 +519,7 @@ def _map_identity(x, step):
 SOLUTION_MAPS = {
     "complement": _map_complement,
     "shift": _map_shift,
+    "shift-binary": _map_shift,
     "scale-var": _map_scale_var,
     "xor-binary": _map_xor_binary,
     "split-free": _map_split_free,

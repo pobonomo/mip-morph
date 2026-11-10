@@ -70,6 +70,9 @@ rm -rf "${DIST_PKG}/__pycache__"
 for mod in "${SECRET_MODULES[@]}"; do
   rm -f "${DIST_PKG}/${mod}.py"
 done
+# Developer-only: ``mipmorph check`` prints every step it verifies, and only the
+# full-featured cli.py, which does not ship either, uses it.
+rm -f "${DIST_PKG}/check.py"
 
 # Drop in the freshly built .so extensions (skip Nuitka's .pyi/build folders).
 for so in "${BUILD_DIR}"/*.so; do

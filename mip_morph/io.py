@@ -139,3 +139,23 @@ def write_problem(problem, path, env=None):
         model.write(str(path))
     finally:
         model.dispose()
+
+
+def solve_problem(problem, time_limit=None, env=None):
+    """Solve ``problem`` and return ``(status, objective, values)``.
+
+    ``values`` lists the best solution found in column order, or is ``None`` when
+    the solver found none. Solving the IR rather than re-reading the file matters
+    for a ranged row: its auxiliary column exists only in the IR, and the point
+    has to cover every column there.
+    """
+    model = model_from_problem(problem, env=env)
+    try:
+        if time_limit is not None:
+            model.setParam("TimeLimit", time_limit)
+        model.optimize()
+        if model.SolCount == 0:
+            return model.Status, None, None
+        return model.Status, model.ObjVal, model.getAttr("X", model.getVars())
+    finally:
+        model.dispose()

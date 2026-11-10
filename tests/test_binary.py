@@ -9,6 +9,10 @@ Two rules, both about not throwing away the binary designation:
   itself, so that is what a binary gets.
 * ``xor-binary`` goes further: it makes the 0/1 nature *implied* by fresh
   binaries rather than declared on the original column.
+
+``shift-binary`` is the deliberate exception to the first rule: it does
+translate a binary, retyping it INTEGER. It is opt-in, so neither rule is broken
+by a default run.
 """
 
 import itertools
@@ -22,9 +26,12 @@ from mip_morph.ir import BINARY, CONTINUOUS, INTEGER, Problem
 from mip_morph.morph import GROWTH_TRANSFORMS, morph_model
 from mip_morph.transforms import (
     Context,
+    DEFAULT_NAMES,
     encode_binary_as_xor,
+    shift_binary,
     shift_variable,
 )
+from mip_morph.unmorph import unmorph_problem, unmorph_solution
 
 
 def _binary_model(n=8, seed=0):
@@ -372,3 +379,86 @@ def test_xor_encoding_on_a_model_without_binaries():
     problem.add_var("y", lb=0.0, ub=5.0, vtype=INTEGER)
     problem.add_var("c", lb=0.0, ub=5.0, vtype=CONTINUOUS)
     assert encode_binary_as_xor(problem, random.Random(0), Context()) is None
+
+
+# ---------------------------------------------------------------------------
+# shift-binary: opt-in translation of a binary, retyped INTEGER
+# ---------------------------------------------------------------------------
+
+
+def _vars_snapshot(problem):
+    return [(v.name, v.lb, v.ub, v.obj, v.vtype) for v in problem.vars]
+
+
+def test_shift_binary_retypes_onto_the_shifted_box():
+    problem = _binary_model(n=4)
+    step = shift_binary(problem, random.Random(0), Context())
+    var = problem.vars[step.params["var"]]
+    delta = step.params["delta"]
+
+    assert var.vtype == INTEGER
+    assert (var.lb, var.ub) == (-delta, 1.0 - delta)
+    assert step.params["vtype"] == BINARY
+    model_from_problem(problem).dispose()  # a BINARY off [0, 1] would raise
+
+
+def test_shift_binary_preserves_the_optimum():
+    problem = _binary_model(n=10)
+    status0, obj0 = _solve(problem)
+    hidden, log = morph_model(problem, rounds=20, seed=4, enable=["shift-binary"])
+    # A shifted column is no longer 0/1, so each binary is shifted at most once.
+    assert len(log) == 10
+    status1, obj1 = _solve(hidden)
+    assert status1 == status0
+    assert obj1 == pytest.approx(obj0)
+
+
+def test_shift_binary_declines_a_model_without_binaries():
+    problem = Problem()
+    problem.add_var("y", lb=0.0, ub=5.0, vtype=INTEGER)
+    problem.add_var("c", lb=0.0, ub=1.0, vtype=CONTINUOUS)
+    assert shift_binary(problem, random.Random(0), Context()) is None
+
+
+def test_shift_binary_is_never_drawn_by_default():
+    assert "shift-binary" not in DEFAULT_NAMES
+    problem = _binary_model(n=10)
+    for seed in range(6):
+        _, log = morph_model(problem, rounds=40, seed=seed)
+        assert all(step.op != "shift-binary" for step in log)
+
+
+@pytest.mark.parametrize("vtype", [BINARY, INTEGER])
+def test_shift_binary_recovers_the_declared_type(vtype):
+    """A 0/1 INTEGER must come back INTEGER, a BINARY must come back BINARY."""
+    problem = _binary_model(n=8)
+    for var in problem.vars:
+        var.vtype = vtype
+    hidden, log = morph_model(
+        problem,
+        rounds=40,
+        seed=2,
+        enable=["shift-binary", "shift", "complement", "scale-row", "mix-row"],
+    )
+    assert any(step.op == "shift-binary" for step in log)
+    recovered = unmorph_problem(hidden, log.key)
+    assert _vars_snapshot(recovered) == _vars_snapshot(problem)
+
+
+def test_shift_binary_solution_maps_back():
+    problem = _binary_model(n=8)
+    hidden, log = morph_model(problem, rounds=12, seed=5, enable=["shift-binary"])
+    model = model_from_problem(hidden)
+    try:
+        model.setParam("OutputFlag", 0)
+        model.optimize()
+        assert model.Status == GRB.OPTIMAL
+        values = {v.VarName: v.X for v in model.getVars()}
+    finally:
+        model.dispose()
+
+    original = unmorph_solution(values, log.key)
+    assert all(round(x) in (0, 1) for x in original.values())
+    _, obj0 = _solve(problem)
+    cost = sum(v.obj * original[v.name] for v in problem.vars)
+    assert cost == pytest.approx(obj0)

@@ -4,7 +4,7 @@ import random
 
 from .ir import coef_range
 from .key import Key, structure_fingerprint, values_fingerprint
-from .transforms import ALL_NAMES, TRANSFORMS, Context
+from .transforms import ALL_NAMES, DEFAULT_NAMES, TRANSFORMS, Context
 
 DEFAULT_ROUNDS = 40
 DEFAULT_MAX_COEF_RATIO = 1e6
@@ -22,8 +22,12 @@ DEFAULT_DISPATCH_FANOUT = 4
 
 
 def resolve_transforms(enable=None, disable=None):
-    """Work out which transformations to draw from."""
-    names = list(enable) if enable else list(ALL_NAMES)
+    """Work out which transformations to draw from.
+
+    Without ``enable`` this is ``DEFAULT_NAMES``: opt-in transformations only run
+    when listed explicitly.
+    """
+    names = list(enable) if enable else list(DEFAULT_NAMES)
     unknown = [n for n in names if n not in TRANSFORMS]
     if unknown:
         raise ValueError(
@@ -82,18 +86,101 @@ def shuffle_all(problem, rng):
     return col_order, row_order
 
 
+# --------------------------------------------------------------------------
+# carrying a solution forward
+# --------------------------------------------------------------------------
+#
+# Each map takes the point ``x`` (values by column index), the step just
+# accepted, and the model *after* that step, and rewrites ``x`` into the step's
+# variable space. These run inside the hiding loop rather than being replayed
+# from a key afterwards because ``slack`` needs the row as it stood at that
+# step, which a key does not record. They mirror ``unmorph.SOLUTION_MAPS``.
+
+
+def _append(x, index, value, step):
+    if index != len(x):
+        raise AssertionError(
+            f"step {step.op!r} added column {index}, but the point has {len(x)} values"
+        )
+    x.append(value)
+
+
+def _fwd_complement(x, step, problem):
+    x[step.params["var"]] = step.params["total"] - x[step.params["var"]]
+
+
+def _fwd_shift(x, step, problem):
+    x[step.params["var"]] -= step.params["delta"]
+
+
+def _fwd_scale_var(x, step, problem):
+    x[step.params["var"]] /= step.params["factor"]
+
+
+def _fwd_xor_binary(x, step, problem):
+    # Any of (u, v, w) with u + v - 2w == x works; (x, 0, 0) is the simplest.
+    # Rounding keeps the fresh binaries exactly integral when the solver returned
+    # x within its integrality tolerance of 0 or 1.
+    value = float(round(x[step.params["var"]]))
+    _append(x, step.params["u"], value, step)
+    _append(x, step.params["v"], 0.0, step)
+    _append(x, step.params["w"], 0.0, step)
+
+
+def _fwd_split_free(x, step, problem):
+    j = step.params["var"]
+    value = x[j]
+    x[j] = 0.0  # the retired column is fixed at zero
+    _append(x, step.params["pos"], max(value, 0.0), step)
+    _append(x, step.params["neg"], max(-value, 0.0), step)
+
+
+def _fwd_slack(x, step, problem):
+    # The fold went *out of* this row into another one, so the row still reads
+    # ``a'x + c * s = rhs`` and ``s`` follows from it. Clamped at zero so that a
+    # point satisfying the inequality only to tolerance does not break the
+    # slack's bound instead.
+    row = problem.rows[step.params["row"]]
+    slack = step.params["slack"]
+    activity = sum(c * x[j] for j, c in row.coeffs.items() if j != slack)
+    value = (row.rhs - activity) / row.coeffs[slack]
+    _append(x, slack, max(value, 0.0), step)
+
+
+def _fwd_identity(x, step, problem):
+    """Row operations and objective mixing do not move the variable space."""
+
+
+FORWARD_MAPS = {
+    "complement": _fwd_complement,
+    "shift": _fwd_shift,
+    "shift-binary": _fwd_shift,
+    "scale-var": _fwd_scale_var,
+    "xor-binary": _fwd_xor_binary,
+    "split-free": _fwd_split_free,
+    "scale-row": _fwd_identity,
+    "invert-row": _fwd_identity,
+    "slack": _fwd_slack,
+    "mix-row": _fwd_identity,
+    "dispatch": _fwd_identity,
+    "mix-obj": _fwd_identity,
+}
+
+
 class MorphLog(list):
     """The applied steps, plus the :class:`~mip_morph.key.Key` that inverts them.
 
     A plain ``list`` of :class:`~mip_morph.key.Step` as far as every existing
     caller is concerned -- it prints, iterates, counts and compares exactly as
     the old list of strings did -- with the key hanging off ``.key`` for callers
-    that want to write one.
+    that want to write one, and ``.solution`` holding the hidden point when
+    ``morph_model`` was given one to carry.
     """
 
-    def __init__(self, iterable=(), key=None):
+    def __init__(self, iterable=(), key=None, solution=None):
         super().__init__(iterable)
         self.key = key
+        self.solution = solution
 
 
 def morph_model(
@@ -110,6 +197,8 @@ def morph_model(
     preserve_objective=None,
     growth_fraction=DEFAULT_GROWTH_FRACTION,
     dispatch_fanout=DEFAULT_DISPATCH_FANOUT,
+    solution=None,
+    on_step=None,
 ):
     """Return a transformed copy of ``problem`` plus a log of what was applied.
 
@@ -126,6 +215,11 @@ def morph_model(
     :class:`~mip_morph.key.Key` on ``log.key``. Pass that key and the hidden
     model to :func:`mip_morph.unmorph.unmorph_problem` to get this ``problem``
     back.
+
+    ``on_step``, if given, is called as ``on_step(step, model, point)`` after
+    every accepted step, with the model as it stands after that step and the
+    carried ``solution`` (or ``None``) already moved into its variable space.
+    It is for checking a run as it goes; it must not modify either argument.
     """
     names = resolve_transforms(enable, disable)
     rng = random.Random(seed)
@@ -147,6 +241,15 @@ def morph_model(
 
     current = problem.copy()
     log = MorphLog(key=key)
+
+    point = None
+    if solution is not None:
+        point = [float(value) for value in solution]
+        if len(point) != len(problem.vars):
+            raise ValueError(
+                f"the solution has {len(point)} values but the model has "
+                f"{len(problem.vars)} columns"
+            )
 
     # Only cap growth transforms when they are sharing the run with others;
     # asking for them explicitly should not be silently throttled.
@@ -173,6 +276,10 @@ def morph_model(
                 continue  # too much numerical damage; leave the model alone
             current = candidate
             log.append(step)
+            if point is not None:
+                FORWARD_MAPS[step.op](point, step, current)
+            if on_step is not None:
+                on_step(step, current, point)
             if name in GROWTH_TRANSFORMS:
                 growth_used += 1
             break
@@ -193,6 +300,11 @@ def morph_model(
     key.values_fingerprint = values_fingerprint(current)
 
     if shuffle:
-        shuffle_all(current, rng)
+        col_order, _ = shuffle_all(current, rng)
+        if point is not None:
+            point = [point[old] for old in col_order]
+
+    if point is not None:
+        log.solution = {var.name: value for var, value in zip(current.vars, point)}
 
     return current, log

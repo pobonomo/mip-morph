@@ -15,3 +15,6 @@ dist/
 # running `uv` in the wrong directory.
 .venv/
 /uv.lock
+
+# Saved by failing `mipmorph check` runs
+mipmorph-check-failures/

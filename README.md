@@ -37,6 +37,9 @@ options:
   --key PATH            where to write the recovery key (default <output>.key)
   --no-key              write no key, making the hiding one-way
   --key-password PW     encrypt the key; also read from $MIPMORPH_KEY_PASSWORD
+  --sol PATH            solve the original first and write its solution, carried onto
+                        the hidden model, to PATH
+  --time-limit SECONDS  time limit for that solve; the best solution found is used
   -q, --quiet           only report errors
 ```
 
@@ -49,6 +52,46 @@ python -m mipmorph unhide-sol hidden.sol -o original.sol    # -> the original va
 
 Both read `<input>.key` unless `--key` says otherwise. See [The key](#the-key) below.
 
+`--sol` goes the other way: it solves the original, then carries that solution through every
+transformation as it is applied, so the hidden model comes with a known feasible point of the same
+objective value (useful as a MIP start, or to check a solver on the hidden model). The point is
+carried during the run rather than rebuilt from the key, because a `slack` value depends on its row
+as it stood at that step. Fresh XOR binaries are set to `(x, 0, 0)` and a split free variable to
+`(max(x, 0), max(-x, 0))`; any of the equivalent choices would do.
+
+### Checking that a run preserves the objective
+
+```bash
+python -m mipmorph check model.mps --rounds 1000 --disable xor-binary
+python -m mipmorph check model.mps --sol model.sol --no-solve   # no Gurobi solve at all
+python -m mipmorph check model.mps --runs 100 --seed 0          # seeds 0..99, one line each
+python -m mipmorph check model.mps --runs 1000 -x               # stop at the first failure
+```
+
+`check` runs the ordinary driver (default 1000 rounds, and the same transformation options as
+hiding) while carrying a point of the original through every step. After each step it recomputes the
+point's objective, offset included, and its worst bound, integrality and row violation on the model
+as it stands, and reports any step that moves either past `--tol` (default 1e-6) by its position and
+description. The point is the original's optimum, or the solution in `--sol`. It then solves the
+hidden model and compares the two optima within `--opt-tol` (default 1e-4, Gurobi's default
+`MIPGap`); `--no-solve` skips that. `--runs N` repeats the whole check with N seeds — `S, S+1, ...`
+under `--seed S`, random ones otherwise — reusing the one reference point, and ends with the seeds
+that failed; every seed is printed, so any run can be replayed alone, and `-x` / `--stop-on-failure`
+stops at the first failing run.
+
+A failing run saves what reproduces it under `--failure-dir` (default `mipmorph-check-failures/`):
+`seed<S>.mps` is the hidden model — byte for byte what `mipmorph model.mps -o … --seed S` with the
+same options writes — with its key `seed<S>.mps.key`, and `seed<S>.sol` is the expected solution of
+it: the reference point as carried through every step, labelled with the objective it should have.
+`original.sol` holds the reference point itself, and `seed<S>.txt` the command that replays the run
+and every step's objective and violation, marking the steps that made things worse rather than every
+step that merely inherited the damage. The exit status is 0 when everything holds, 1 when a check
+fails, and 2 on an error.
+
+The per-step check shows the hidden model has a point as good as the original's optimum; only the
+final solve shows it has none better. `check` is developer-only and is not part of the release
+build.
+
 As a library:
 
 ```python
@@ -60,23 +103,28 @@ write_problem(hidden, "hidden.mps")
 write_key(log.key, "hidden.mps.key")
 
 assert unmorph_problem(hidden, log.key) == problem
+
+# Carry a solution (values in column order) onto the hidden model:
+hidden, log = morph_model(problem, rounds=40, seed=42, solution=values)
+log.solution  # {hidden column name: value}
 ```
 
 ## Transformations
 
-| name         | what it does                                                                                       |
-| ------------ | -------------------------------------------------------------------------------------------------- |
-| `complement` | substitutes `x = l + u - x'` on a bounded integer or binary                                        |
-| `shift`      | substitutes `x = y + δ`, translating a variable's box (never a binary)                             |
-| `xor-binary` | replaces a binary by `x = u + v - 2w` with `w = u ∧ v`, making integrality _implied_               |
-| `scale-var`  | substitutes `x = a·y` with `a > 0` (continuous columns only)                                       |
-| `split-free` | replaces a free variable by `x⁺ - x⁻`, both non-negative                                           |
-| `scale-row`  | multiplies a row through by a nonzero factor, flipping the sense if negative                       |
-| `invert-row` | turns a `<=` row into a `>=` row by negating it                                                    |
-| `slack`      | turns an inequality into an equality with an explicit non-negative slack, folded into a second row |
-| `mix-row`    | adds a multiple of an equality row to another row                                                  |
-| `dispatch`   | scatters **one** equality row into several rows at once, a different multiple into each            |
-| `mix-obj`    | adds a multiple of an equality row to the objective                                                |
+| name           | what it does                                                                                       |
+| -------------- | -------------------------------------------------------------------------------------------------- |
+| `complement`   | substitutes `x = l + u - x'` on a bounded integer or binary                                        |
+| `shift`        | substitutes `x = y + δ`, translating a variable's box (never a binary)                             |
+| `shift-binary` | opt-in: shifts a binary off [0, 1] and retypes it integer, trading solver strength for hiding      |
+| `xor-binary`   | replaces a binary by `x = u + v - 2w` with `w = u ∧ v`, making integrality _implied_               |
+| `scale-var`    | substitutes `x = a·y` with `a > 0` (continuous columns only)                                       |
+| `split-free`   | replaces a free variable by `x⁺ - x⁻`, both non-negative                                           |
+| `scale-row`    | multiplies a row through by a nonzero factor, flipping the sense if negative                       |
+| `invert-row`   | turns a `<=` row into a `>=` row by negating it                                                    |
+| `slack`        | turns an inequality into an equality with an explicit non-negative slack, folded into a second row |
+| `mix-row`      | adds a multiple of an equality row to another row                                                  |
+| `dispatch`     | scatters **one** equality row into several rows at once, a different multiple into each            |
+| `mix-obj`      | adds a multiple of an equality row to the objective                                                |
 
 Names are mangled to `C0001…`/`R0001…` and row/column order is permuted at the end, unless
 `--no-rename` / `--no-shuffle` are given.
@@ -187,6 +235,12 @@ reasoning all key off it. So `shift` **excludes binaries** — translating one o
 it to a general integer and throw that away, for no gain in obfuscation. `complement` is the only
 nontrivial affine map of {0, 1} onto itself, so that is the cheap way to disguise a binary.
 
+If you do want binaries translated, `--enable shift-binary,...` turns on `shift-binary`. Shifting by
+an integer `δ` is exact — the column ranges over `{-δ, 1-δ}` — but it cannot stay BINARY (Gurobi
+clamps a BINARY off [0, 1] to `LB = UB = 0`), so it is retyped as a general integer on the shifted
+box and the key records its original type. It is never drawn in a default run, because it gives up
+exactly the strength described above.
+
 `xor-binary` is the thorough way. It substitutes `x = u + v - 2w` for fresh binaries `u, v, w`, with
 `w = u ∧ v` linearized as `w ≤ u`, `w ≤ v`, `w ≥ u + v - 1`. Over the integers those rows admit
 exactly `(0,0,0)`, `(0,1,0)`, `(1,0,0)`, `(1,1,1)`, so `u + v - 2w` takes exactly the values {0, 1};
@@ -288,13 +342,13 @@ the point — so only the four variable substitutions have to be inverted, and e
 The human-readable log is lossy in five separate ways, which is why the key records parameters
 separately from the description:
 
-| loss                                                                        | consequence                            |
-| --------------------------------------------------------------------------- | -------------------------------------- |
-| every float is `%g`-formatted, i.e. six significant digits                   | `--sloppy-scaling` factors unrecoverable |
-| `dispatch` names neither its target rows nor its per-target multipliers      | the fanout cannot be undone            |
-| `slack` reports where it folded but not the multiplier                       | the fold cannot be undone              |
-| `xor-binary` overwrites the original `vtype` and never reports it            | BINARY vs INTEGER lost                 |
-| `rename_all` discards the name map, `shuffle_all` both permutations          | nothing can be lined up again          |
+| loss                                                                    | consequence                              |
+| ----------------------------------------------------------------------- | ---------------------------------------- |
+| every float is `%g`-formatted, i.e. six significant digits              | `--sloppy-scaling` factors unrecoverable |
+| `dispatch` names neither its target rows nor its per-target multipliers | the fanout cannot be undone              |
+| `slack` reports where it folded but not the multiplier                  | the fold cannot be undone                |
+| `xor-binary` overwrites the original `vtype` and never reports it       | BINARY vs INTEGER lost                   |
+| `rename_all` discards the name map, `shuffle_all` both permutations     | nothing can be lined up again            |
 
 Replaying the driver from its seed is not an alternative either. The coefficient-range guard rolls a
 candidate back **after** it has already drawn from the RNG, and only accepted steps are logged, so
@@ -305,19 +359,19 @@ the seed and the list of accepted steps do not determine one another.
 Two properties the forward transformations already had:
 
 - **Indices mean the same thing all run.** No transformation deletes a column or a row —
-  `split-free` *retires* its column rather than removing it — and every addition is appended. So the
+  `split-free` _retires_ its column rather than removing it — and every addition is appended. So the
   original columns keep indices `0…n₀-1` for the whole run, and whatever a step appended is still at
   the tail when that step comes to be undone.
-- **Steps are undone in reverse.** Walking backwards, by the time step *k* is reached the model is
-  exactly in its post-step-*k* state, so every index it recorded still points where it did and the
+- **Steps are undone in reverse.** Walking backwards, by the time step _k_ is reached the model is
+  exactly in its post-step-_k_ state, so every index it recorded still points where it did and the
   rows a fold read are unmodified since. No inverse has to reason about what came after it.
 
 Only the final shuffle defeats indices, so recovery starts by re-indexing the hidden model onto the
-*pre-shuffle* names stored in the key. That one step undoes the permutation and absorbs any
+_pre-shuffle_ names stored in the key. That one step undoes the permutation and absorbs any
 reordering the writer or reader introduced, so nothing downstream has to trust file order.
 
 Two places need care. `scale-var` must **divide by the recorded factor**, never multiply by a stored
-reciprocal — `1/0.1` is not representable. And a fold has to restore the target's *sparsity*, not
+reciprocal — `1/0.1` is not representable. And a fold has to restore the target's _sparsity_, not
 just its numbers, since the forward pass drops entries that cancel to zero; the key records which
 columns each fold introduced rather than letting the inverse guess from the values, because under
 `--sloppy-scaling` two folds touching one entry leave a rounding residue where a clean zero would
@@ -329,19 +383,20 @@ through a write/read round trip in both MPS and LP format.
 
 ### Three honest limits
 
-1. **The key recovers the model as read, not the original file's bytes.** Gurobi's reader desugars an
-   MPS `RANGES` entry into an equality plus an auxiliary column, and drops explicitly stored zeros,
-   both *before* the IR exists. Those happen upstream of anything a key can observe, so a model with
-   `RANGES` recovers to its desugared equivalent — the same mathematics, not the same MPS.
+1. **The key recovers the model as read, not the original file's bytes.** Gurobi's reader desugars
+   an MPS `RANGES` entry into an equality plus an auxiliary column, and drops explicitly stored
+   zeros, both _before_ the IR exists. Those happen upstream of anything a key can observe, so a
+   model with `RANGES` recovers to its desugared equivalent — the same mathematics, not the same
+   MPS.
 2. **`--sloppy-scaling` recovers only to floating-point tolerance**, because the forward pass itself
    rounds there. The key still stores the exact factor, which is the best available.
 3. **A key without a password is obfuscated, not encrypted.** On disk it is canonical JSON, then
    zlib, then base64 behind a magic line, so it is not human-readable and will not be skimmed by
-   accident — but anyone who wants the contents can inflate them in two lines. Pass
-   `--key-password` (or `$MIPMORPH_KEY_PASSWORD`, which keeps it out of the process list) for actual
-   confidentiality: scrypt for the KDF, an HMAC-SHA256 counter-mode keystream, and encrypt-then-MAC
-   so a damaged key is refused rather than half-decoded. This matters, because a leaked key undoes
-   the hiding completely.
+   accident — but anyone who wants the contents can inflate them in two lines. Pass `--key-password`
+   (or `$MIPMORPH_KEY_PASSWORD`, which keeps it out of the process list) for actual confidentiality:
+   scrypt for the KDF, an HMAC-SHA256 counter-mode keystream, and encrypt-then-MAC so a damaged key
+   is refused rather than half-decoded. This matters, because a leaked key undoes the hiding
+   completely.
 
 ## Tests
 
@@ -360,11 +415,14 @@ transformation chains in exact rational arithmetic to verify the float path does
 `tests/test_dispatch.py` asserts the structural invariant that separates hiding from presolve — no
 transformation may shrink a column's support or leave a free column singleton behind.
 
-Recovery is the one place equality *is* asserted directly, since a key makes the mapping explicit:
+Recovery is the one place equality _is_ asserted directly, since a key makes the mapping explicit:
 `tests/test_key.py` compares the recovered model to the original coefficient by coefficient, inverts
 each transformation on its own, maps solutions back and evaluates them on the original model, and
 checks that a key from another run, another model, or a wrong password is refused rather than
 half-applied.
+
+`tests/test_check.py` covers `mipmorph check`, including that it pins a deliberately broken forward
+map on the step that broke it.
 
 Test models stay well under 2000 variables/constraints so they run on the size-limited Gurobi trial
 license.

@@ -20,7 +20,7 @@ multiplication is exact in IEEE double arithmetic and equivalence is bit-exact.
 ``ctx.sloppy_scaling`` trades that for arbitrary factors in [0.1, 10].
 """
 
-from .ir import BINARY, CONTINUOUS, FLIP, INF, drop_zeros, negate
+from .ir import BINARY, CONTINUOUS, FLIP, INF, INTEGER, drop_zeros, negate
 from .key import Step
 
 DYADIC = (0.125, 0.25, 0.5, 2.0, 4.0, 8.0)
@@ -141,8 +141,45 @@ def shift_variable(problem, rng, ctx):
         row.rhs -= row.coeffs[j] * delta
 
     problem.obj_offset += var.obj * delta
+    return Step("shift", {"var": j, "delta": delta}, f"shift {var.name} by {delta:g}")
+
+
+def shift_binary(problem, rng, ctx):
+    """Substitute ``x = y + delta`` for a 0/1 column, retyping it INTEGER.
+
+    The opt-in counterpart of ``shift``. Exact: ``y`` ranges over
+    ``{-delta, 1 - delta}``, which is integral because ``delta`` is. The column
+    cannot stay BINARY -- Gurobi clamps a BINARY with bounds off [0, 1] to
+    LB=UB=0 -- so it becomes a general INTEGER on the shifted box. That costs
+    the clique, cover and implied-bound reasoning ``shift`` refuses to give up,
+    which is why this is not in the default set; presolve may still recover the
+    two-valued column, but that is up to the solver.
+
+    The declared type is recorded: a 0/1 column may have been BINARY or an
+    INTEGER pinned to [0, 1], and the hidden model no longer says which.
+    """
+    candidates = [j for j, v in enumerate(problem.vars) if v.is_zero_one]
+    if not candidates:
+        return None
+
+    j = rng.choice(candidates)
+    var = problem.vars[j]
+    delta = float(rng.choice(SHIFTS))
+
+    var.lb -= delta
+    var.ub -= delta
+    vtype = var.vtype
+    var.vtype = INTEGER
+
+    for row in problem.rows_with(j):
+        row.rhs -= row.coeffs[j] * delta
+
+    problem.obj_offset += var.obj * delta
     return Step(
-        "shift", {"var": j, "delta": delta}, f"shift {var.name} by {delta:g}"
+        "shift-binary",
+        {"var": j, "delta": delta, "vtype": vtype},
+        f"shift binary {var.name} by {delta:g} (now integer in "
+        f"[{var.lb:g}, {var.ub:g}])",
     )
 
 
@@ -230,9 +267,7 @@ def encode_binary_as_xor(problem, rng, ctx):
 
 def split_free_variable(problem, rng, ctx):
     """Replace a free variable by the difference of two non-negative ones."""
-    candidates = [
-        j for j, v in enumerate(problem.vars) if v.lb <= -INF and v.ub >= INF
-    ]
+    candidates = [j for j, v in enumerate(problem.vars) if v.lb <= -INF and v.ub >= INF]
     if not candidates:
         return None
 
@@ -533,6 +568,7 @@ def mix_equality_into_objective(problem, rng, ctx):
 TRANSFORMS = {
     "complement": complement_variable,
     "shift": shift_variable,
+    "shift-binary": shift_binary,
     "xor-binary": encode_binary_as_xor,
     "scale-var": scale_variable,
     "split-free": split_free_variable,
@@ -545,3 +581,9 @@ TRANSFORMS = {
 }
 
 ALL_NAMES = tuple(TRANSFORMS)
+
+# Drawn from only when asked for by name. ``shift-binary`` demotes a 0/1 column to
+# a general integer, which is a deliberate trade of solver strength for hiding,
+# so a default run must not make it silently.
+OPT_IN_NAMES = ("shift-binary",)
+DEFAULT_NAMES = tuple(n for n in ALL_NAMES if n not in OPT_IN_NAMES)
